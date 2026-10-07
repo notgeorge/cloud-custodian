@@ -1318,6 +1318,55 @@ class TestPolicyCollection(BaseTest):
         self.assertEqual(iam[0].options.output_dir, "/test/output/eu-west-1")
         self.assertEqual(len(collection), 3)
 
+    def _region_all_collection(self, profile_region, enabled_regions):
+        session = mock.MagicMock(region_name=profile_region)
+        session.client.return_value.describe_regions.return_value = {
+            'Regions': [{'RegionName': r} for r in enabled_regions]}
+        self.patch(aws, '_profile_session', session)
+        original = policy.PolicyCollection.from_data(
+            {"policies": [
+                {"name": "ec2", "resource": "ec2"},
+                {"name": "iam", "resource": "iam-user"}]},
+            Config.empty(regions=["us-east-1"]))
+        collection = AWS().initialize_policies(original, Config.empty(regions=["all"]))
+        return collection, session
+
+    def test_policy_region_all_follows_the_partition_of_the_profile_region(self):
+        for profile_region, enabled in (
+                ('us-gov-west-1', ['us-gov-east-1', 'us-gov-west-1']),
+                ('cn-north-1', ['cn-north-1', 'cn-northwest-1']),
+                ('us-iso-east-1', ['us-iso-east-1', 'us-iso-west-1'])):
+            collection, session = self._region_all_collection(profile_region, enabled)
+            # the enabled regions are listed from the profile's own region
+            session.client.assert_called_once_with('ec2', region_name=profile_region)
+            # regional resources run in each region of the partition, and no other
+            self.assertEqual(
+                sorted(p.options.region for p in collection if p.name == 'ec2'), enabled)
+            # global resources run once, in a region of that partition
+            iam = [p for p in collection if p.name == 'iam']
+            self.assertEqual(len(iam), 1)
+            self.assertEqual(iam[0].options.region, enabled[0])
+
+    def test_policy_region_all_commercial_partition_is_unchanged(self):
+        enabled = ['eu-west-1', 'us-east-1', 'us-west-2']
+        collection, session = self._region_all_collection('eu-west-1', enabled)
+        session.client.assert_called_once_with('ec2', region_name='eu-west-1')
+        self.assertEqual(
+            sorted(p.options.region for p in collection if p.name == 'ec2'), enabled)
+        iam = [p for p in collection if p.name == 'iam']
+        self.assertEqual([p.options.region for p in iam], ['us-east-1'])
+
+    def test_policy_region_all_profile_without_a_region(self):
+        # a profile with no region of its own used to fail building the ec2 client
+        # with NoRegionError. Its regions are listed from us-east-1 instead.
+        enabled = ['eu-west-1', 'us-east-1', 'us-west-2']
+        collection, session = self._region_all_collection(None, enabled)
+        session.client.assert_called_once_with('ec2', region_name='us-east-1')
+        self.assertEqual(
+            sorted(p.options.region for p in collection if p.name == 'ec2'), enabled)
+        iam = [p for p in collection if p.name == 'iam']
+        self.assertEqual([p.options.region for p in iam], ['us-east-1'])
+
     def test_policy_filter_mode(self):
         cfg = Config.empty(regions=['us-east-1'])
         original = policy.PolicyCollection.from_data(

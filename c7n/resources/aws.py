@@ -786,16 +786,29 @@ class AWS(Provider):
         region in the list).
 
         Note for region partitions (govcloud and china) an explicit
-        region from the partition must be passed in.
+        region from the partition must be passed in, except for 'all',
+        which means every region of the partition the profile's region
+        belongs to (AWS_DEFAULT_REGION, or the region set for the profile).
         """
         from c7n.policy import Policy, PolicyCollection
         policies = []
-        service_region_map, resource_service_map = get_service_region_map(
-            options.regions, policy_collection.resource_types, self.type)
+        partition = None
+        # global endpoints are queried from us-east-1, or from a region of
+        # the partition when the credentials belong to another one.
+        global_region = 'us-east-1'
         if 'all' in options.regions:
+            profile_session = get_profile_session(options)
+            partition = utils.get_partition(profile_session.region_name) or 'aws'
+            global_region = utils.get_partition_region(partition)
+        service_region_map, resource_service_map = get_service_region_map(
+            options.regions, policy_collection.resource_types, self.type, partition)
+        if 'all' in options.regions:
+            # a profile without a region of its own would fail to build the client
             enabled_regions = {
                 r['RegionName'] for r in
-                get_profile_session(options).client('ec2').describe_regions(
+                profile_session.client(
+                    'ec2', region_name=profile_session.region_name or global_region
+                ).describe_regions(
                     Filters=[{'Name': 'opt-in-status',
                               'Values': ['opt-in-not-required', 'opted-in']}]
                 ).get('Regions')}
@@ -808,10 +821,10 @@ class AWS(Provider):
                 resource_service_map.get(resource_type), ())
 
             # its a global service/endpoint, use user provided region
-            # or us-east-1.
+            # or us-east-1 (see global_region above).
             if not available_regions and options.regions:
                 candidates = [r for r in options.regions if r != 'all']
-                candidate = candidates and candidates[0] or 'us-east-1'
+                candidate = candidates and candidates[0] or global_region
                 svc_regions = [candidate]
             elif 'all' in options.regions:
                 svc_regions = list(set(available_regions).intersection(enabled_regions))
@@ -868,7 +881,7 @@ def fake_session():
     return session
 
 
-def get_service_region_map(regions, resource_types, provider='aws'):
+def get_service_region_map(regions, resource_types, provider='aws', partition=None):
     # we're not interacting with the apis just using the sdk meta information.
 
     session = fake_session()
@@ -892,6 +905,8 @@ def get_service_region_map(regions, resource_types, provider='aws'):
     for r in regions:
         if r in partition_regions:
             partitions.append(partition_regions[r])
+    if partition and partition not in partitions:
+        partitions.append(partition)
 
     service_region_map = {}
     for s in set(itertools.chain(resource_service_map.values())):
